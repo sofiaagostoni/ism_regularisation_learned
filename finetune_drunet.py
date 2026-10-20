@@ -78,7 +78,7 @@ sigma_vis  = 0.05
 
 # ---- modello / loss ----
 pretrained = None          # None = da zero; "download" = fine-tuning
-loss_name  = 'FFL'
+loss_name  = 'L1'
 
 LOSS_WEIGHTS = {
     'L2':          dict(w_l1=0.0, w_ffl=0.0, w_l2=1.0, w_cldice=0.0),
@@ -107,8 +107,7 @@ config = {
     "seed": random_seed,
 }
 
-# ---- cartella di output unica (prima di wandb.init: se fallisce,
-#      non resta una run wandb aperta) ----
+
 run_tag = (f"{'scratch' if pretrained is None else 'finetune'}_{loss_name}_"
            f"{time.strftime('%Y%m%d-%H%M%S')}")
 out_dir = os.path.join("training_drunet_newloss", run_tag)
@@ -197,7 +196,6 @@ val_noisy = torch.stack([
 ssim = SSIM()
 psnr = PSNR()
 
-# PSNR dell'input rumoroso: la baseline da battere
 psnr_input = np.array([
     psnr(val_noisy[k], validation_set).mean().item() for k in range(len(sigma_test))
 ])
@@ -254,7 +252,7 @@ def validate(net):
 
 #%%
 # ============================================================================
-# 4. TRAINING LOOP (a iterazioni)
+# 4. TRAINING LOOP
 # ============================================================================
 
 loss_hist, SSIM_val_vett, PSNR_val_vett, val_iters = [], [], [], []
@@ -277,7 +275,7 @@ for it in range(1, total_iters + 1):
 
     with amp_ctx():
         out = model(noisy, sigma=sigma)
-    loss, parts, weights = criterion(out.float(), clean)   # loss sempre in fp32
+    loss, parts, weights = criterion(out.float(), clean)   
 
     # ---------------- STEP ----------------
     optimizer.zero_grad(set_to_none=True)
@@ -286,7 +284,6 @@ for it in range(1, total_iters + 1):
     optimizer.step()
     scheduler.step()
 
-    # EMA attiva dopo il warmup (il primo update copia i pesi)
     if it >= warmup_iters:
         ema_model.update_parameters(model)
 

@@ -28,22 +28,55 @@ from models import utils as wcrr_utils  # noqa: E402
 GRADIENT_ALGOS = {"MD", "GD"}
 
 
-class WCRRPrior(dinv.optim.Prior):
-    """Weakly convex ridge regularizer R(x), with explicit cost and gradient."""
+class AllPassConv(torch.nn.Module):
+    """
+    Drop-in replacement for the WCRR multi-convolution: every channel gets the same
+    zero-mean all-pass filter, |H(f)| = 1 for f != 0 and H(0) = 0, i.e.
+        W_c x = (x - mean(x)) / sqrt(C)       (mean over the image)
+    so W^T W = I - (projection on constants) and ||W|| = 1, as for the learned filters.
+    The regularizer becomes pixel-wise: only the learned activations and scalings act.
+    """
 
-    def __init__(self, device="cpu", mode = "pretrained", n_power_steps=200):
+    def __init__(self, num_channels):
+        super().__init__()
+        self.num_channels = num_channels
+        self.L = torch.tensor(1.)                            # already normalized
+
+    @staticmethod
+    def _zero_mean(x):
+        return x - x.mean(dim=(-2, -1), keepdim=True)
+
+    def forward(self, x):
+        return self._zero_mean(x).repeat(1, self.num_channels, 1, 1) / self.num_channels ** 0.5
+
+    def transpose(self, y):
+        return self._zero_mean(y.sum(1, keepdim=True)) / self.num_channels ** 0.5
+
+    def spectral_norm(self, *args, **kwargs):
+        return self.L
+
+
+class WCRRPrior(dinv.optim.Prior):
+    """Weakly convex ridge regularizer, with explicit cost and gradient.
+    allpass=True: learned filters replaced by AllPassConv (learned activations only)."""
+
+    def __init__(self, device="cpu", mode = "pretrained", n_power_steps=200, allpass=False):
         super().__init__()
         self.explicit_prior = True
         self.smooth_prior = True
         if mode == "pretrained":
             self.model = wcrr_utils.load_model("WCRR-CNN", str(device))
         elif mode == "ISMtrain":
-            self.model = wcrr_utils.load_model("WCRR-CNN_ISM", str(device), base_dir="/data/cil/sofia/ism_regularisation_learned/training_wcrr/trained_models")
+            self.model = wcrr_utils.load_model("WCRR-CNN-ISM", str(device), base_dir="/data/cil/sofia/ism_regularisation_learned/training_wcrr/trained_models")
+        elif mode == "ISMtrain_softplus":
+            self.model = wcrr_utils.load_model("WCRR-CNN-softplus-ISM", str(device), base_dir="/data/cil/sofia/ism_regularisation_learned/training_wcrr/trained_models")
 
 
         # Lipschitz bound of the conv layer, computed once
         with torch.no_grad():
             self.model.conv_layer.spectral_norm(mode="power_method", n_steps=n_power_steps)
+        if allpass:
+            self.model.conv_layer = AllPassConv(self.model.num_channels)
 
         # Move the model, including tensors stored as plain attributes (spline grids)
         self.model.to(device)
@@ -145,10 +178,18 @@ def get_denoiser(loss, cfg):
     name = cfg.prior_name
     if name == "TV":
         return dinv.models.TVDenoiser(n_it_max=20)
-    if name == "weakly_convex":
+    if name == "WCRR":
         return WCRRPrior(device=cfg.device, mode='pretrained')
-    if name == "weakly_convex_ISM":
+    if name == "WCRR_ISM":
         return WCRRPrior(device=cfg.device, mode='ISMtrain')
+    if name == "WCRR_softplus_ISM":
+        return WCRRPrior(device=cfg.device, mode='ISMtrain_softplus')
+    if name == "WCRR_allpass":                       # learned activations, all-pass filters
+        return WCRRPrior(device=cfg.device, mode='pretrained', allpass=True)
+    if name == "WCRR_ISM_allpass":
+        return WCRRPrior(device=cfg.device, mode='ISMtrain', allpass=True)
+    if name == "WCRR_softplus_ISM_allpass":
+        return WCRRPrior(device=cfg.device, mode='ISMtrain_softplus', allpass=True)
     if name == "TV_smooth":
         return SmoothTVPrior(eps=cfg.tv_eps)
     if name == "L1":

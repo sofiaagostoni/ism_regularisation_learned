@@ -49,7 +49,8 @@ except ImportError:
     micro_structural_similarity = None
 
 # Priors with an explicit cost R(x): lambda is searched, backtracking can be used
-EXPLICIT_PRIORS = {"weakly_convex", "weakly_convex_ISM", "TV_smooth", "L1"}
+EXPLICIT_PRIORS = {"WCRR", "WCRR_ISM", "WCRR_softplus_ISM", "TV_smooth", "L1",
+                   "WCRR_allpass", "WCRR_ISM_allpass", "WCRR_softplus_ISM_allpass"}
 # Priors that do not use sigma (g_param): the sigma grid is not searched
 PRIORS_WITHOUT_SIGMA = {"TV_smooth", "L1"}
 # Priors whose weights depend on the training loss (one checkpoint per loss)
@@ -78,7 +79,7 @@ class Config:
     pxsizex: float = 40
     is_3d: bool = False
 
-    # prior: 'TV', 'Drunet', 'Drunet_finetune', 'weakly_convex', 'TV_smooth', 'L1'
+    # prior: 'TV', 'Drunet', 'Drunet_finetune', 'WCRR', 'TV_smooth', 'L1'
     prior_name: str = "Drunet_finetune"
     tv_eps: float = 1e-2                       # smoothing of 'TV_smooth' (Lip grad R = 8/eps)
     ckpt_dir: str = "training_drunet_newloss"

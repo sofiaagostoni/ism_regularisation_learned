@@ -51,8 +51,8 @@ if torch.cuda.is_available():
 # ---- dati ----
 Nx = 256
 pxsizex = 25.0
-n_train, n_val = 1000, 300
-CACHE = "training_drunet/training_dataset/varied_dataset.pth"
+n_train, n_val = 2000, 300
+CACHE = "training_drunet_newloss/training_dataset/varied_dataset.pth"
 
 # ---- training (tutto in ITERAZIONI, non epoche) ----
 total_iters  = 100_000     # budget totale; scalalo in base a it/s (vedi log)
@@ -78,7 +78,7 @@ sigma_vis  = 0.05
 
 # ---- modello / loss ----
 pretrained = None          # None = da zero; "download" = fine-tuning
-loss_name  = 'L1'
+loss_name  = 'FFL'
 
 LOSS_WEIGHTS = {
     'L2':          dict(w_l1=0.0, w_ffl=0.0, w_l2=1.0, w_cldice=0.0),

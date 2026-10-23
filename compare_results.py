@@ -29,7 +29,9 @@ PRIOR_NAMES = {
     "drunet": "DRUNet-ft",
     "drunet_gauss": "DRUNet",
 }
-EXPLICIT = {"weakly_convex", "TV_smooth", "L1"}      # lambda is searched
+EXPLICIT = {"WCRR", "WCRR_ISM", "WCRR_softplus_ISM", "weakly_convex",
+            "weakly_convex_ISM", "TV_smooth", "L1",
+            "WCRR_allpass", "WCRR_ISM_allpass", "WCRR_softplus_ISM_allpass"}
 PRIORS_WITHOUT_SIGMA = {"TV_smooth", "L1"}          # sigma is not used
 PRIORS_USING_LOSS = {"Drunet_finetune", "drunet"}   # one checkpoint per training loss
 
@@ -78,7 +80,7 @@ def params_str(r):
     parts = []
     if r.prior not in PRIORS_WITHOUT_SIGMA:
         parts.append(f"sigma={_fmt(r.sigma, '.3g')}")
-    if r.prior in EXPLICIT:
+    if r.prior in EXPLICIT or (pd.notna(r["lambda"]) and r["lambda"] != 1):
         parts.append(f"lambda={_fmt(r['lambda'], '.3g')}")
     if pd.notna(r.step_scale) and (r.prior not in EXPLICIT or r.step_scale != 1):
         parts.append(f"step x{_fmt(r.step_scale, '.3g')}")
@@ -547,7 +549,7 @@ if __name__ == "__main__":
     # split_by_fidelity=False puts KL and L2 runs in the same tables
     df = load(ROOT, split_by_fidelity=False)   # also: exclude_legacy=True, run_ids=[...]
     best = best_per_method(df)
-    DATA = "tub_level"                            # or "tub_level" for the 2D results
+    DATA = "tub_balls"                            # or "tub_level" for the 2D results
     PLANE = 0                                  # 3D: plane shown in the images (None = max proj.)
 
 #%%
@@ -568,7 +570,7 @@ if __name__ == "__main__":
 
 #%%
     # Reconstructions + FFT for one flux (methods=None: all methods)
-    plot_reconstructions(best, DATA, 5,
+    plot_reconstructions(best, DATA, 20,
                          methods=None,         # e.g. ["WCRR", "TV-smooth", "L1-norm"]
                          plane=PLANE,
                          crop=None,            # e.g. (64, 192, 64, 192) to zoom
@@ -577,7 +579,7 @@ if __name__ == "__main__":
 
 #%%
     # One method: best parameters and reconstructions
-    show_method(best, DATA, "WCRR [PROJ_GD] KL", flux=20, plane=PLANE)
+    show_method(best, DATA, "WCRR_ISM [PROJ_GD] KL", flux=5, plane=PLANE)
     # show_method(best, DATA, "TV-smooth [PROJ_GD] KL")              # all fluxes
     # show_method(best, DATA, "L1-norm [PROX_GD] L2", flux=[5, 20])
 #%%

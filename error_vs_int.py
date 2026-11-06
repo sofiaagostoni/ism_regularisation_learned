@@ -674,6 +674,7 @@ if __name__ == "__main__":
         figs[f"{m}_map"] = plot_metric_maps(gt, res, metric=m, pairs=COMPARE,
                                             title=f"{m} per bin, {DATA}, flux {FLUX:g}")
     if LOCAL_FRC:
+        
         figs["local_frc"] = plot_local_frc(gt, recons, pairs=COMPARE, threshold=FRC_THRESHOLD,
                                            pixel_size=PIXEL_SIZE, unit=PIXEL_UNIT,
                                            title=f"{DATA}, flux {FLUX:g}", **LOCAL_FRC)

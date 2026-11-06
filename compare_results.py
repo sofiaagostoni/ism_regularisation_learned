@@ -6,6 +6,7 @@ Reads summary_all.csv, plus the best_rec_*.pth files for the images.
 3D data: images show one axial plane (plane=0 by default, the regularized one);
 plane=None shows the max projection over the planes.
 """
+import json
 import os
 
 import numpy as np
@@ -16,7 +17,7 @@ from matplotlib.patches import Rectangle
 import ISM.analysis.Graph_lib as gr
 
 
-ROOT = "Results/results_gridsearch"
+ROOT = "Results/evaluation_stop"            # evaluate_methods.py; old grid search: "Results/results_gridsearch"
 
 # Display names; unknown priors are shown with their own name
 PRIOR_NAMES = {
@@ -40,9 +41,20 @@ PRIORS_USING_LOSS = {"Drunet_finetune", "drunet"}   # one checkpoint per trainin
 # Loading and text tables
 # ---------------------------------------------------------------------------
 
-def load(root=ROOT, run_ids=None, exclude_legacy=False, split_by_fidelity=True):
+def run_search(root, run_id):
+    """Search type of a run, from its config.json: 'adaptive' or 'grid'."""
+    path = os.path.join(root, str(run_id), "config.json")
+    if not os.path.exists(path):
+        return "grid"
+    with open(path) as f:
+        return json.load(f).get("search", "grid")
+
+
+def load(root=ROOT, run_ids=None, exclude_legacy=False, split_by_fidelity=True, search=None):
     """split_by_fidelity=False: compare KL and L2 runs in the same tables
-    (the fidelity is then shown in the method name)."""
+    (the fidelity is then shown in the method name).
+    search: 'adaptive' = only the runs of evaluate_methods.py (adaptive search),
+    'grid' = only the fixed-grid runs, None = all."""
     df = pd.read_csv(os.path.join(root, "summary_all.csv"))
     for col in ("step_scale", "stepsize", "prior"):        # missing in old files
         if col not in df:
@@ -51,6 +63,11 @@ def load(root=ROOT, run_ids=None, exclude_legacy=False, split_by_fidelity=True):
         df = df[df.run_id.isin(run_ids)]
     if exclude_legacy:
         df = df[~df.run_id.astype(str).str.startswith("legacy_")]
+    if search is not None:
+        kind = {r: run_search(root, r) for r in df.run_id.unique()}
+        df = df[df.run_id.map(kind) == search]
+        if df.empty:
+            raise ValueError(f"no finished {search}-search results in {root}")
     # raw values are needed to rebuild the result file names
     df["fidelity_raw"] = df.fidelity.astype(str)
     df["loss_raw"] = df.loss.astype(str)
@@ -382,7 +399,7 @@ def plot_reconstructions(df, data, flux, fidelity=None, methods=None, root=ROOT,
                          plane=0, pxsize_um=0.04, crop=None, spectrum=True, window=True,
                          normalize=False, shared_scale=True, vmax=None,
                          cmap="hot", save=None):
-    """
+    """|
     Ground truth + best reconstruction of each method (row 1), their FFTs
     (row 2) and, optionally, the radially averaged power spectra.
 
@@ -469,6 +486,95 @@ def plot_reconstructions(df, data, flux, fidelity=None, methods=None, root=ROOT,
     plt.show()
 
 
+_SUM_Y_CACHE = {}
+
+
+def sum_measurements(res):
+    """
+    Sum of the 25 detector images of the measurement a result was computed from.
+    The measurement is not saved in the .pth: it is simulated again with the same
+    seed (same noise realization), and cached. Returns (sum_y, metrics vs ground truth).
+    """
+    from opt_functions.data_preparation import load_data, make_measurements
+    from opt_functions.Solver_functions.pnp_utils import Config, compute_final_metrics
+    c = res.get("config") or {}
+    key = (res["name"], res["flux"], c.get("seed", 0))
+    if key not in _SUM_Y_CACHE:
+        Nz = c.get("Nz", 1)
+        # default device, as in the evaluation: the noise depends on the device RNG
+        cfg = Config(Nx=c.get("Nx", 256), Nz=Nz, pxsizex=c.get("pxsizex", 40),
+                     is_3d=Nz > 1, seed=key[2])
+        x = load_data(res["name"], cfg)
+        sum_y = make_measurements(x, res["flux"], cfg)["sum_y"].cpu()
+        _SUM_Y_CACHE[key] = sum_y, compute_final_metrics(x[:, :1], sum_y)
+    return _SUM_Y_CACHE[key]
+
+
+def plot_all_images(df, flux, fidelity=None, methods=None, root=ROOT, plane=0, crop=None,
+                    normalize=True, show_sum=True, cmap="hot", save=None):
+    """
+    Every image tested at one flux: one row per image, ground truth (+ sum of the
+    25 measurements) + best reconstruction of each method; columns ordered by mean
+    PSNR over the images.
+
+    df        : output of best_per_method(load(...))
+    methods   : substring or list of substrings to keep; None = all
+    normalize : True = each image divided by its max (as for PSNR/SSIM)
+    show_sum  : add the sum of the 25 detector images (simulated again, same seed);
+                always divided by its max, with its own scale if normalize=False
+    Colour scale shared within each row.
+    """
+    g = df[df.flux == flux]
+    if fidelity is not None:
+        g = g[g.fidelity == fidelity.upper()]
+    if methods is not None:
+        methods = [methods] if isinstance(methods, str) else methods
+        g = g[g.method.apply(lambda m: any(s in m for s in methods))]
+    if g.empty:
+        raise ValueError(f"no results for flux={flux}, fidelity={fidelity}")
+    order = list(g.groupby("method").psnr.mean().sort_values(ascending=False).index)
+    images = sorted(g.data.unique())
+
+    sum_label = "Sum of 25 detectors"
+    n_cols = len(order) + 1 + show_sum
+    fig, axes = plt.subplots(len(images), n_cols, squeeze=False, layout="constrained",
+                             figsize=(2.6 * n_cols, 2.6 * len(images) + 0.6))
+    for i, data in enumerate(images):
+        rows = {r.method: r for r in g[g.data == data].itertuples()}
+        recs = {m: load_rec(r, root) for m, r in rows.items()}
+        first = next(iter(recs.values()))
+        panels = [("Ground truth", to_img(first["x_gt"], normalize, plane))]
+        metrics = {}
+        if show_sum:
+            sum_y, metrics[sum_label] = sum_measurements(first)
+            panels.append((sum_label, to_img(sum_y, True, plane)))
+        panels += [(m, to_img(recs[m]["x_rec"], normalize, plane)
+                    if m in recs and recs[m]["x_rec"] is not None else None) for m in order]
+        metrics.update({m: {"psnr": r.psnr, "ssim": r.ssim} for m, r in rows.items()})
+        own_scale = {sum_label} if not normalize else set()
+        vmax = max(float(im.max()) for m, im in panels if im is not None and m not in own_scale)
+        for j, (m, im) in enumerate(panels):
+            ax = axes[i, j]
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if im is None:
+                ax.text(0.5, 0.5, "-", ha="center", va="center", transform=ax.transAxes)
+            else:
+                ax.imshow(_crop(im, crop), cmap=cmap, vmin=0,
+                          vmax=float(im.max()) if m in own_scale else vmax)
+            title = m if i == 0 else ""
+            if m in metrics:
+                title += f"\nPSNR {metrics[m]['psnr']:.2f}  SSIM {metrics[m]['ssim']:.3f}"
+            ax.set_title(title.strip("\n"), fontsize=8)
+        axes[i, 0].set_ylabel(data, fontsize=10)
+
+    fid = f" | fidelity {fidelity.upper()}" if fidelity else ""
+    fig.suptitle(f"All images | flux {flux}{fid}{_plane_label(plane)}", fontsize=12)
+    if save:
+        fig.savefig(save, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
 # ---------------------------------------------------------------------------
 # One method: parameters, metrics and reconstructions
 # ---------------------------------------------------------------------------
@@ -544,12 +650,176 @@ def show_method(df, data, method, flux=None, fidelity=None, root=ROOT,
     return g
 
 
+# ---------------------------------------------------------------------------
+# Convergence: functional F(x_k) = f + lam R per iteration
+# ---------------------------------------------------------------------------
+
+def plot_functional(df, data, flux, fidelity=None, methods=None, root=ROOT,
+                    kind="gap", rates=(1,), save=None):
+    """
+    Functional F(x_k) saved by the explicit-prior iterations (metrics["cost"]),
+    one curve per method.
+
+    kind    : "gap" = (F(x_k) - F*) / |F*| on log-log axes, F* = min of each curve
+              (the last iterates are then biased towards 0: F* is not the true minimum);
+              "F"   = F(x_k) itself (each method has its own lambda, R and fidelity:
+              compare the shapes, not the levels)
+    rates   : "gap" only: reference slopes C / k^p for every p, e.g. (1, 2)
+    methods : substrings of method names, None = all methods with a cost history
+    Curves from files saved before the float64 fix (no "cost_def") are dashed:
+    float32 smooth part (data term only for L1 / PROX_GD), floor ~1e-7 relative.
+    """
+    g = _select(df, data, flux, fidelity, methods)
+    curves = {}
+    for r in g.itertuples():
+        res = load_rec(r, root)
+        cost = (res.get("metrics") or {}).get("cost")
+        if not cost or not len(cost[0]):
+            continue                    # PnP / RED: no explicit functional
+        curves[r.method] = (np.asarray(cost[0], dtype=np.float64),
+                            res.get("cost_def") == "F_fp64")
+    if not curves:
+        raise ValueError(f"no cost history for data={data}, flux={flux}")
+
+    colors = _method_colors(list(curves))
+    fig, ax = plt.subplots(figsize=(10, 5), layout="constrained")
+    k_max, gap_max = 1, 0.0
+    for method, (F, new) in curves.items():
+        k = np.arange(1, len(F) + 1)    # cost[k-1] = F after k iterations
+        y = F if kind == "F" else (F - F.min()) / abs(F.min())
+        if kind != "F":
+            y = np.where(y > 0, y, np.nan)      # log axis: drop the exact minimum
+            gap_max = max(gap_max, np.nanmax(y[:10]))
+        k_max = max(k_max, len(F))
+        ax.plot(k, y, color=colors[method], lw=1.6, ls="-" if new else "--",
+                label=method + ("" if new else "  (old fp32)"))
+
+    ax.set_xscale("log")
+    ax.set_xlabel("iteration k")
+    if kind == "F":
+        ax.set_ylabel(r"$F(x_k)$")
+    else:
+        ax.set_yscale("log")
+        ax.set_ylabel(r"$(F(x_k) - F^*) / |F^*|$")
+        kk = np.array([1.0, k_max])
+        for p in rates:                 # anchored at the largest gap of the first iterates
+            ax.plot(kk, gap_max * kk ** -p, color="0.5", lw=1, ls=":")
+            ax.annotate(rf"$k^{{-{p}}}$", (kk[-1], gap_max * kk[-1] ** -p), color="0.4",
+                        fontsize=8, ha="left", va="center")
+    ax.grid(alpha=0.3, which="both")
+    fig.legend(fontsize=8, frameon=False, loc="outside right center")
+    fid = f" | fidelity {fidelity.upper()}" if fidelity else ""
+    ax.set_title(f"{data} | flux {flux:g}{fid}")
+    if save:
+        fig.savefig(save, dpi=200, bbox_inches="tight")
+    plt.show()
+    return curves
+
+
+def convergence_check(df, data, flux, fidelity=None, methods=None, root=ROOT,
+                      tail=0.1, save=None):
+    """
+    Empirical check of a KL-type convergence theorem (bounded iterates -> finite length,
+    convergence to a critical point) on the iterates z_k (unclamped) of each method.
+    Needs the histories written with log_cost (refresh_histories.py / new runs).
+
+    Panels (linear iteration axis):
+      PSNR(z_k)               deepinv PSNR of z_k clamped to [0, 1], NOT divided by its
+                              max (the tables divide by the max: values differ)
+      (F - F*)/|F*|           F* = min of each curve
+      ||G(z_k)|| / ||G(z_0)|| G(z) = z - P_{>=0}(z - grad F(z)), projected gradient: the
+                              constrained version of ||grad F|| (z >= 0), 0 iff critical
+      ||z_{k+1} - z_k|| / ||z_k|| (the quantity of the early stop, its tolerance dashed);
+      ||z_k|| (bounded); step size tau_k = 1 / L_k (a small step norm
+      with tau_k at the fallback 1 / L_max means a stalled backtracking, not convergence).
+    The table also gives the length sum ||z_{k+1} - z_k||.
+    Prints a summary table and returns it; tail = fraction of the last iterations used
+    for "tail length" and "fallback %".
+    """
+    g = _select(df, data, flux, fidelity, methods)
+    runs, skipped = {}, []
+    for r in g.itertuples():
+        res = load_rec(r, root)
+        m = res.get("metrics") or {}
+        keys = ("psnr", "cost", "step_norm", "iterate_norm", "criticality")
+        if not all(k in m for k in keys):
+            skipped.append(r.method)
+            continue
+        runs[r.method] = {k: np.asarray(m[k][0], dtype=np.float64) for k in keys}
+        L = res.get("L_history")
+        runs[r.method]["tau"] = 1.0 / np.asarray(L, dtype=np.float64) if L else None
+        runs[r.method]["stop_tol"] = (res.get("config") or {}).get("stop_tol")
+    if skipped:
+        print("no convergence history (run refresh_histories.py):\n  " + "\n  ".join(skipped))
+    if not runs:
+        raise ValueError(f"no convergence histories for data={data}, flux={flux}")
+
+    colors = _method_colors(list(runs))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 7.5), layout="constrained")
+    ax = dict(zip(["psnr", "F", "crit", "step", "norm", "tau"], axes.flat))
+    rows = []
+    for method, h in runs.items():
+        F, s, n, c, tau = h["cost"], h["step_norm"], h["iterate_norm"], h["criticality"], h["tau"]
+        k = np.arange(1, len(F) + 1)
+        kw = dict(color=colors[method], lw=1.4, label=method)
+        ax["psnr"].plot(np.arange(len(h["psnr"])), h["psnr"], **kw)   # k = 0 .. N
+        gap = (F - F.min()) / abs(F.min())
+        ax["F"].plot(k, np.where(gap > 0, gap, np.nan), **kw)
+        ax["crit"].plot(np.arange(len(c)), c / c[0], **kw)   # at z_k, k = 0 .. N-1
+        # relative step of the early stop: ||z_{k+1} - z_k|| / ||z_k||, with ||z_k|| =
+        # iterate_norm[k-1]; ||z_0|| is not saved: ||z_1|| is used for the first step
+        rel = s / np.r_[n[0], n[:-1]]
+        ax["step"].plot(k, rel, **kw)
+        length = np.cumsum(s)
+        ax["norm"].plot(k, n, **kw)                       # ||z_k||, k >= 1
+        n_tail = max(1, int(tail * len(s)))
+        fallback = np.nan
+        if tau is not None:
+            ax["tau"].plot(np.arange(1, len(tau) + 1), tau, **kw)
+            fallback = float(np.isclose(tau[-n_tail:], tau.min(), rtol=1e-6).mean())
+        rows.append({"method": method, "max ||z_k||": n.max(), "length": length[-1],
+                     f"tail length (last {tail:.0%})": s[-n_tail:].sum(),
+                     "last rel. step": rel[-1], "crit last / first": c[-1] / c[0],
+                     f"fallback steps (last {tail:.0%})": fallback,
+                     "F increases": int((np.diff(F) > 1e-12 * abs(F[0])).sum())})
+
+    labels = {"psnr": r"PSNR ($z_k$ clamped to [0, 1])", "F": r"$(F(z_k) - F^*) / |F^*|$",
+              "crit": r"$\|G(z_k)\| / \|G(z_0)\|$,  $G(z) = z - P_+(z - \nabla F(z))$",
+              "step": r"$\|z_{k+1} - z_k\| / \|z_k\|$", "norm": r"$\|z_k\|$",
+              "tau": r"step size $\tau_k = 1/L_k$"}
+    for key, a in ax.items():
+        if key in ("F", "crit", "step", "tau"):
+            a.set_yscale("log")
+        a.set_title(labels[key], fontsize=10)
+        a.set_xlabel("iteration k")
+        a.grid(alpha=0.3, which="both")
+    for tol in {h["stop_tol"] for h in runs.values() if h["stop_tol"] is not None}:
+        ax["step"].axhline(tol, color="k", ls="--", lw=1)
+        ax["step"].annotate(f"stop tol {tol:g}", (0.01, tol), xycoords=("axes fraction", "data"),
+                            fontsize=8, va="bottom")
+    handles, lbls = ax["F"].get_legend_handles_labels()
+    fig.legend(handles, lbls, fontsize=8, frameon=False, loc="outside right center")
+    fid = f" | fidelity {fidelity.upper()}" if fidelity else ""
+    fig.suptitle(f"Convergence check | {data} | flux {flux:g}{fid}")
+    if save:
+        fig.savefig(save, dpi=200, bbox_inches="tight")
+    plt.show()
+
+    table = pd.DataFrame(rows).set_index("method")
+    with pd.option_context("display.width", 250, "display.max_columns", None,
+                           "display.float_format", "{:.3g}".format):
+        print(table)
+    return table
+
+
+
 #%%
 if __name__ == "__main__":
     # split_by_fidelity=False puts KL and L2 runs in the same tables
-    df = load(ROOT, split_by_fidelity=False)   # also: exclude_legacy=True, run_ids=[...]
+    # search="adaptive": only the current evaluate_methods.py runs ("grid": the old ones, None: all)
+    df = load(ROOT, split_by_fidelity=False, search="adaptive")
     best = best_per_method(df)
-    DATA = "tub_balls"                            # or "tub_level" for the 2D results
+    DATA = "circle_phantom"                            # or "tub_level" for the 2D results
     PLANE = 0                                  # 3D: plane shown in the images (None = max proj.)
 
 #%%
@@ -570,7 +840,7 @@ if __name__ == "__main__":
 
 #%%
     # Reconstructions + FFT for one flux (methods=None: all methods)
-    plot_reconstructions(best, DATA, 20,
+    plot_reconstructions(best, DATA, 40,
                          methods=None,         # e.g. ["WCRR", "TV-smooth", "L1-norm"]
                          plane=PLANE,
                          crop=None,            # e.g. (64, 192, 64, 192) to zoom
@@ -578,8 +848,20 @@ if __name__ == "__main__":
                          shared_scale=True)    # False: one colorbar per panel
 
 #%%
+    # All images at one flux: rows = images, columns = ground truth + methods
+    plot_all_images(best, 20, methods=["WCRR_ISM", "TV-smooth"])                  # e.g. methods=["WCRR", "TV-smooth"]
+
+#%%
     # One method: best parameters and reconstructions
     show_method(best, DATA, "WCRR_ISM [PROJ_GD] KL", flux=5, plane=PLANE)
     # show_method(best, DATA, "TV-smooth [PROJ_GD] KL")              # all fluxes
     # show_method(best, DATA, "L1-norm [PROX_GD] L2", flux=[5, 20])
+
 #%%
+    # Convergence of the functional F(x_k) = f + lam R (explicit priors only)
+    # plot_functional(best, DATA, 40, kind="gap")            # e.g. methods=["WCRR", "TV-smooth"], rates=(1, 2)
+    plot_functional(best, DATA, 40, kind="gap", methods = ['WCRR'])   # F(x_k) itself
+#%%
+    # Bounded iterates, finite length, criticality, step sizes (needs refresh_histories.py)
+    convergence_check(best, DATA, 20, methods=["WCRR", "TV-smooth"])          # e.g. methods=["WCRR", "TV-smooth"]
+# %%

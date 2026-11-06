@@ -59,28 +59,28 @@ PLOT_SETUP = True      # plot ground truth, PSFs and measurements before running
 PSF_CROP = 64          # pixels shown around the PSF center (None = full PSF)
 
 # --- WCRR -------------------------------------------------------------------
-cfg = Config(
-    prior_name="WCRR",   #WCRR_softplus_ISM
-    save_dir="Results/results_gridsearch",
-    is_3d=False,
-    Nz=1,
-    init_choice="adjoint_y",
-    kl_step_scale=1e-1,
-    l2_step_scale=1,
-    sigma_grid=torch.logspace(0.5, 2, 10),     # searched
-    lam_grid=torch.logspace(-2,0 , 20),         # searched
-    iter_grid=torch.tensor([5000]),           # one value: run length
-    backtracking="custom",                    # step adapted -> not searched
-)
-algo_list = ["PROJ_GD"]
-loss_list = [ "L2"]                            # WCRR ignores the loss: keep one entry
+# cfg = Config(
+#     prior_name="WCRR",   #WCRR_softplus_ISM
+#     save_dir="Results/results_gridsearch",
+#     is_3d=False,
+#     Nz=1,
+#     init_choice="adjoint_y",
+#     kl_step_scale=1e-1,
+#     l2_step_scale=1,
+#     sigma_grid=torch.logspace(0.5, 2, 10),     # searched
+#     lam_grid=torch.logspace(-2,0 , 20),         # searched
+#     iter_grid=torch.tensor([5000]),           # one value: run length
+#     backtracking="custom",                    # step adapted -> not searched
+# )
+# algo_list = ["PROJ_GD"]
+# loss_list = [ "L2"]                            # WCRR ignores the loss: keep one entry
 
 # --- Smoothed TV ------------------------------------------------------------
-# cfg = Config(prior_name="TV_smooth", tv_eps=1e-2, is_3d=True, Nz=2,
-#              save_dir="Results/results_gridsearch", kl_step_scale=1e-3, l2_step_scale=1e1,
-#              lam_grid=torch.logspace(-3, 1, 9), iter_grid=torch.tensor([5000]))
-# algo_list = ["PROJ_GD"]
-# loss_list = ["L2"]
+cfg = Config(prior_name="TV_smooth", tv_eps=1e-2, is_3d=True, Nz=2,
+             save_dir="Results/results_gridsearch", kl_step_scale=1e-3, l2_step_scale=1e1,
+             lam_grid=torch.logspace(-3, 1, 9), iter_grid=torch.tensor([5000]))
+algo_list = ["PROJ_GD"]
+loss_list = ["L2"]
 
 # --- L1 ---------------------------------------------------------------------
 # cfg = Config(prior_name="L1", is_3d=True, Nz=2,
@@ -99,7 +99,7 @@ loss_list = [ "L2"]                            # WCRR ignores the loss: keep one
 # algo_list = ["PGD"]
 # loss_list = ["L2"]             # Drunet_finetune: one checkpoint per loss
 
-data_list = ["tub_balls"]
+data_list = ["circle_phantom"]
 flux_list = [5, 10, 20, 40, 60]
 fidelity_list = ["L2"]
 
@@ -233,7 +233,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Single experiment: arguments override the cfg grids (one value = no search)
 # ---------------------------------------------------------------------------
-cfg.prior_name = "WCRR"
+cfg.prior_name = "TV-smooth"
 cfg.kl_step_scale = 1e-2
 cfg.l2_step_scale = 1e-1
 res = run_experiment(cfg, "circle_phantom", 20, "L2", "KL", algo="Proj_GD",

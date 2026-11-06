@@ -12,6 +12,7 @@ import os
 import torch
 import deepinv as dinv
 from deepinv.optim.data_fidelity import PoissonLikelihood, L2
+from deepinv.optim.distance import PoissonLikelihoodDistance      # MD ADDED
 from deepinv.physics import PoissonNoise
 
 import ISM.simulation.PSF_sim as ism
@@ -56,6 +57,33 @@ class PoissonWithBackground(PoissonNoise):
 
     def forward(self, x, **kwargs):
         return super().forward(x + self.bkg, **kwargs)
+
+
+# >>>>>>>>>> MD ADDED >>>>>>>>>>
+class PoissonNoBkgDistance(PoissonLikelihoodDistance):
+    """KL without background: sum z - y log z (z = A x in counts, y in counts).
+    A x is clamped to 1e-12 so that tiny FFT round-off values never reach the log."""
+
+    def fn(self, x, y, *args, **kwargs):
+        if self.denormalize:
+            y = y / self.gain
+        z = (x / self.gain).clamp_min(1e-12)
+        return (-y * torch.log(z)).flatten().sum() + (z - y).reshape(x.shape[0], -1).sum(dim=1)
+
+    def grad(self, x, y, *args, **kwargs):
+        if self.denormalize:
+            y = y / self.gain
+        z = (x / self.gain).clamp_min(1e-12)
+        return (1 / self.gain) * (1 - y / z)
+
+
+class PoissonLikelihoodNoBkg(PoissonLikelihood):
+    """PoissonLikelihood with background 0 (fidelity 'KL0', used by mirror descent)."""
+
+    def __init__(self, gain=1.0):
+        super().__init__(gain=gain, bkg=0.0, denormalize=True)
+        self.d = PoissonNoBkgDistance(gain=gain, bkg=0.0, denormalize=True)
+# <<<<<<<<<< MD ADDED <<<<<<<<<<
 
 
 class SummedBlurPhysics(dinv.physics.LinearPhysics):
@@ -143,7 +171,16 @@ def _finish(x, PSF, physics_list, finger_print, eta_vec, flux, device):
         L_kl = L_kl + y_j.abs().max() / eta_j ** 2 * norm_A
         L_l2 = L_l2 + norm_A                      # L2 with sigma = 1
 
+    # >>>>>>>>>> MD ADDED >>>>>>>>>>
+    # KL without background: not Lipschitz smooth, but L-smooth relative to the Burg
+    # entropy with L = ||y||_1 in counts (as in ism_regularisation, _effective_L_max 'md')
+    df_kl0 = dinv.optim.StackedPhysicsDataFidelity(
+        [PoissonLikelihoodNoBkg(gain=1 / flux) for _ in eta_vec])
+    L_kl0 = sum(float(y_j.abs().sum()) for y_j in y) * flux      # y_j / gain = counts
+    # <<<<<<<<<< MD ADDED <<<<<<<<<<
+
     sum_y = torch.stack(list(y)).sum(0)           # sum over detectors
     return {"PSF": PSF, "y": y, "avg_y": sum_y / N_DET, "sum_y": sum_y,
             "finger_print": finger_print, "physics": physics,
-            "df_kl": df_kl, "df_l2": df_l2, "L_kl": L_kl, "L_l2": L_l2}
+            "df_kl": df_kl, "df_l2": df_l2, "L_kl": L_kl, "L_l2": L_l2,
+            "df_kl0": df_kl0, "L_kl0": L_kl0}                    # MD ADDED: df_kl0, L_kl0

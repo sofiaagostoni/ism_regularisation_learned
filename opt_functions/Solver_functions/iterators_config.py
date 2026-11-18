@@ -7,7 +7,7 @@ iterations gives the result for every iteration count of the grid):
     'PNP_MD'   PnP mirror descent (Burg entropy), then D
     'PROJ_GD'  explicit priors, x >= 0, optional adaptive backtracking:
     'PROX_GD'  gradient step on R if smooth (WCRR, TV_smooth), prox step on R
-               if not (L1). The two names are the same iteration.
+               if not (L1, TV_nonsmooth). The two names are the same iteration.
     'MD_BURG'  (MD ADDED) explicit priors, mirror descent with the Burg entropy and
                backtracking, from ism_regularisation. Use with fidelity 'KL0'.
 Any other algo name is passed to deepinv as a built-in iteration.
@@ -21,12 +21,18 @@ iteration.history (copied by pnp_utils.solve into metrics):
     step_norm[k]    = ||x_{k+1} - x_k||                  finite length: sum < inf
     iterate_norm[k] = ||x_{k+1}||                        boundedness
     criticality[k]  = ||x_k - max(0, x_k - grad F(x_k))|| KKT residual of
-                      min F s.t. x >= 0 (0 iff x_k is critical; for L1, grad F
-                      includes lam, the gradient of lam ||x||_1 on x >= 0)
+                      min F s.t. x >= 0 (0 iff x_k is critical). Non-smooth R
+                      (L1, TV_nonsmooth): ||x_k - max(0, prox_{lam R}(x_k - grad f))||
+                      (for L1 = the formula above with grad F = grad f + lam)
 Stopping (stop_tol not None): stop once ||x_{k+1} - x_k|| / ||x_k|| < stop_tol for
-stop_patience consecutive iterations (checked on the unclamped iterates; see check_stop).
+stop_patience consecutive iterations (checked on the unclamped iterates; see check_stop),
+never before stop_min_iter iterations: the backtracking starts from the conservative
+1 / L_safe and the step needs ~50-100 iterations to grow to its working size; meanwhile the
+relative step can be below stop_tol although x has not moved (Castle_gray with KL:
+"converged" after 10 iterations at x_0).
 """
 import copy
+import math
 import weakref
 from functools import partial
 
@@ -42,15 +48,16 @@ class SnapshotIterator(OptimIterator):
     """Stores the iterate after n iterations for every n in snap_iters.
     The iterate after n iterations is the input of call n."""
 
-    def __init__(self, snap_iters=(), **kwargs):
+    def __init__(self, snap_iters=(), x_max=1.0, **kwargs):
         super().__init__(**kwargs)
         self.snap_iters = {int(n) for n in snap_iters}
         self.snapshots = {}
         self.n_calls = 0
+        self.x_max = x_max              # snapshots clamped to [0, x_max]; None: [0, inf)
 
     def _snap(self, x):
         if self.n_calls in self.snap_iters:
-            self.snapshots[self.n_calls] = x.detach().clamp(0, 1).cpu().clone()
+            self.snapshots[self.n_calls] = x.detach().clamp(min=0, max=self.x_max).cpu().clone()
         self.n_calls += 1
 
 
@@ -112,9 +119,11 @@ class ProxGDIteration(SnapshotIterator):
     Proximal gradient descent on F = f + lam*R over x >= 0, for explicit priors.
 
     How R is used depends on prior.smooth_prior:
-        smooth R (WCRR, TV_smooth):  x+ = max(0, x - tau * (grad f + lam grad R))
-        non-smooth R (L1):           x+ = max(0, prox_{tau lam R}(x - tau * grad f))
+        smooth R (WCRR, TV_smooth):     x+ = max(0, x - tau * (grad f + lam grad R))
+        non-smooth R (L1, TV_nonsmooth): x+ = max(0, prox_{tau lam R}(x - tau * grad f))
     'PROJ_GD' and 'PROX_GD' are the same iteration; the prior decides.
+    TV_nonsmooth: the prox is iterative (FGP) and already includes x >= 0; its dual is
+    warm-started from the previous outer iteration (state reset for every run).
 
     backtracking=False: tau fixed.
     backtracking=True : each iteration first tries a larger step,
@@ -123,16 +132,22 @@ class ProxGDIteration(SnapshotIterator):
         S(x+) <= S(x) + <grad S(x), x+ - x> + L/2 ||x+ - x||^2,   tau = 1 / L.
     After max_bt loops, or once L >= L_max, the safe step 1/L_max is taken.
     S(x+) is kept and reused as S(x) by the next iteration.
+    float64 re-check: when the float32 test fails by less than fp64_gate * |S(x)|
+    (rounding level of S), the same test is redone with S(x), S(x+) and the model in
+    float64, so that a small but real decrease is not taken for a too-long step.
     The returned "cost" is the full F(x+) = f + lam R in float64 (full_cost_fp64),
     also for L1, where S = f only; with log_cost=False it is S(x+) (cheaper).
     """
 
     def __init__(self, backtracking=False, s=1.0, eta=2.0, delta=0.9,
                  L_max=float("inf"), max_bt=50, log_cost=True, stop_tol=None,
-                 stop_patience=10, **kwargs):
+                 stop_patience=10, stop_min_iter=0, fp64_gate=1e-4, **kwargs):
         super().__init__(**kwargs)
         self.log_cost = log_cost
+        self.fp64_gate = fp64_gate          # float64 re-check of near misses of the test
+        self.n_fp64_checks = 0
         self.stop_tol, self.stop_patience = stop_tol, stop_patience
+        self.stop_min_iter = stop_min_iter  # no stop before this many iterations
         self._n_small = 0                   # consecutive iterations with a small step
         self.backtracking = backtracking
         self.s, self.eta, self.delta = s, eta, delta
@@ -141,7 +156,24 @@ class ProxGDIteration(SnapshotIterator):
         self.L_history = []
         self.n_backtracks = []
         self._S_last = None                 # (iterate, S(iterate)) of the last call
+        self._prox_state = {}               # warm start of iterative prox (TV_nonsmooth)
+        self._crit_state = {}               # same, for the prox in the criticality
         self.history = {"step_norm": [], "iterate_norm": [], "criticality": []}
+
+    def _near_miss(self, s_new, bound, S_prev):
+        """True if the float32 test failed by less than the rounding level of S."""
+        return (math.isfinite(s_new)
+                and s_new - bound <= self.fp64_gate * max(abs(S_prev), 1.0))
+
+    @staticmethod
+    def _S64(x, data_fidelity, prior, lam, sigma, y, physics, with_R):
+        """S in float64: f + lam R (with_R) or f."""
+        if with_R:
+            return float(full_cost_fp64(x, data_fidelity, prior, lam, sigma, y, physics).sum())
+        y64 = (TensorList([t.double() for t in y]) if isinstance(y, TensorList)
+               else y.double())
+        with torch.no_grad():
+            return float(data_fidelity(x.double(), y64, physics).sum())
 
     def _S_prev(self, x_in, S_fn):
         """S at the input iterate, reused from the last call when x_in is its output."""
@@ -151,8 +183,10 @@ class ProxGDIteration(SnapshotIterator):
 
     def check_stop(self, it, X_prev, X):
         """deepinv check_conv_fn: True after stop_patience consecutive iterations with
-        ||x_{k+1} - x_k|| / ||x_k|| < stop_tol (computed in _output)."""
-        return self.stop_tol is not None and self._n_small >= self.stop_patience
+        ||x_{k+1} - x_k|| / ||x_k|| < stop_tol (computed in _output), and at least
+        stop_min_iter iterations done (n_calls = iterations done so far)."""
+        return (self.stop_tol is not None and self._n_small >= self.stop_patience
+                and self.n_calls >= self.stop_min_iter)
 
     @staticmethod
     def _norm(v):
@@ -191,13 +225,20 @@ class ProxGDIteration(SnapshotIterator):
         def step(tau):                  # one (proximal) gradient step, then x >= 0
             z = x_prev - tau * g
             if not smooth_R:
-                z = cur_prior.prox(z, sigma, gamma=tau * lam)
+                z = cur_prior.prox(z, sigma, gamma=tau * lam, warm_start=self._prox_state)
             return z.clamp_min(0)
 
         g = cur_data_fidelity.grad(x_prev, y, physics)
         if smooth_R:
             g = g + lam * cur_prior.grad(x_prev, sigma)
-        crit = self._criticality(x_prev, g if smooth_R else g + lam)
+            crit = self._criticality(x_prev, g)
+        elif self.log_cost:
+            # prox-gradient mapping (unit step): ||x - max(0, prox_{lam R}(x - grad f))||,
+            # 0 iff x is critical. For L1 = the old ||x - max(0, x - (grad f + lam))||.
+            p = cur_prior.prox(x_prev - g, sigma, gamma=lam, warm_start=self._crit_state)
+            crit = self._norm(x_prev - p.clamp_min(0))
+        else:
+            crit = None
 
         out = partial(self._output, x_in=x_prev, crit=crit, cur_data_fidelity=cur_data_fidelity,
                       cur_prior=cur_prior, lam=lam, sigma=sigma, y=y, physics=physics)
@@ -206,6 +247,9 @@ class ProxGDIteration(SnapshotIterator):
             return out(x, S(x))
 
         S_prev = self._S_prev(x_prev, lambda: S(x_prev))
+        S64 = partial(self._S64, data_fidelity=cur_data_fidelity, prior=cur_prior, lam=lam,
+                      sigma=sigma, y=y, physics=physics, with_R=smooth_R)
+        S_prev64 = None                 # computed only if a float64 re-check is needed
 
         if self.tau_k is None:
             self.tau_k = tau
@@ -216,7 +260,17 @@ class ProxGDIteration(SnapshotIterator):
             S_new = S(x)
             d = x - x_prev
             bound = S_prev + float((g * d).sum()) + 0.5 * L * float((d * d).sum())
-            if float(S_new.sum()) <= bound:          # NaN fails the test -> smaller step
+            s_new = float(S_new.sum())
+            ok = s_new <= bound                      # NaN fails the test -> smaller step
+            if not ok and self._near_miss(s_new, bound, S_prev):
+                if S_prev64 is None:
+                    S_prev64 = S64(x_prev)
+                d64 = d.double()
+                model64 = (float((g.double() * d64).sum())
+                           + 0.5 * L * float((d64 * d64).sum()))
+                ok = S64(x) <= S_prev64 + model64
+                self.n_fp64_checks += 1
+            if ok:
                 break
             L *= self.eta
             n_bt += 1
@@ -230,6 +284,11 @@ class ProxGDIteration(SnapshotIterator):
         self.L_history.append(L)
         self.n_backtracks.append(n_bt)
         return out(x, S_new)
+
+
+def _is_l1(prior):
+    from .prior_config import L1Prior
+    return isinstance(getattr(prior, "prior", prior), L1Prior)    # unwrap PlanePrior (3D)
 
 
 # >>>>>>>>>> MD ADDED >>>>>>>>>>
@@ -251,8 +310,8 @@ class MirrorDescentIteration(ProxGDIteration):
     Backtracking as in ism_regularisation: L is multiplied by eta until
         S(x+) <= S(x) - (0.8 / tau) D_h(x+, x),       tau = 1 / L,
     S = f + lam R (also for L1; the original code used S = f for L1).
-    Same candidate step (tau_k / delta, capped at 1 / s) and fallback (step 1/L_max
-    after max_bt loops or when L >= L_max) as ProxGDIteration.
+    Same candidate step (tau_k / delta, capped at 1 / s), fallback (step 1/L_max
+    after max_bt loops or when L >= L_max) and float64 re-check as ProxGDIteration.
     L_max: from fidelity_and_steps, = ||y||_1 (+ lam * Lip(grad R)) for 'KL0'.
     """
 
@@ -267,6 +326,8 @@ class MirrorDescentIteration(ProxGDIteration):
         x_prev = x_in.clamp_min(self.x_eps)          # adjoint_y init can contain zeros
         lam, tau, sigma = cur_params["lambda"], cur_params["stepsize"], cur_params["g_param"]
         smooth_R = getattr(cur_prior, "smooth_prior", True)
+        if not smooth_R and not _is_l1(cur_prior):
+            raise ValueError("MD_BURG supports only smooth priors and L1 (use PROX_GD)")
 
         def S(x):
             # MD: R is always in the test. For L1 the original code tested f only, which
@@ -287,6 +348,9 @@ class MirrorDescentIteration(ProxGDIteration):
             return out(x, S(x))
 
         S_prev = self._S_prev(x_in, lambda: S(x_prev))
+        S64 = partial(self._S64, data_fidelity=cur_data_fidelity, prior=cur_prior, lam=lam,
+                      sigma=sigma, y=y, physics=physics, with_R=True)
+        S_prev64 = None                 # computed only if a float64 re-check is needed
 
         if self.tau_k is None:
             self.tau_k = tau
@@ -296,7 +360,15 @@ class MirrorDescentIteration(ProxGDIteration):
             x = step(1.0 / L)
             S_new = S(x)
             bound = S_prev - self.armijo * L * float(bregman_burg(x, x_prev))
-            if float(S_new.sum()) <= bound:          # NaN / x <= 0 fails -> smaller step
+            s_new = float(S_new.sum())
+            ok = s_new <= bound                      # NaN / x <= 0 fails -> smaller step
+            if not ok and self._near_miss(s_new, bound, S_prev):
+                if S_prev64 is None:
+                    S_prev64 = S64(x_prev)
+                D64 = float(bregman_burg(x.double(), x_prev.double()))
+                ok = S64(x) <= S_prev64 - self.armijo * L * D64
+                self.n_fp64_checks += 1
+            if ok:
                 break
             L *= self.eta
             n_bt += 1
@@ -318,16 +390,17 @@ CUSTOM_ITERATIONS = {"PGD": PnPPGDIteration, "PNP_MD": PnPMDIteration,
                      "MD_BURG": MirrorDescentIteration}          # MD ADDED: MD_BURG
 
 
-def get_iteration(algo, snap_iters=(), log_cost=True, **bt_kwargs):
+def get_iteration(algo, snap_iters=(), log_cost=True, x_max=1.0, **bt_kwargs):
     """Custom iteration object, or the algo name for a deepinv built-in iteration.
     bt_kwargs (backtracking and stopping settings) and log_cost are used by PROJ_GD /
-    PROX_GD / MD_BURG only."""
+    PROX_GD / MD_BURG only. x_max: snapshots clamped to [0, x_max] (None: no upper bound,
+    e.g. real data in photon counts)."""
     cls = CUSTOM_ITERATIONS.get(algo.upper())
     if cls is None:
         return algo.upper()
     if cls in (ProxGDIteration, MirrorDescentIteration):         # MD ADDED: MirrorDescentIteration
-        return cls(snap_iters=snap_iters, log_cost=log_cost, **bt_kwargs)
-    return cls(snap_iters=snap_iters)
+        return cls(snap_iters=snap_iters, log_cost=log_cost, x_max=x_max, **bt_kwargs)
+    return cls(snap_iters=snap_iters, x_max=x_max)
 
 
 def init_fn(observation, physics, init_choice):
@@ -338,20 +411,23 @@ def init_fn(observation, physics, init_choice):
         x0 = torch.randn_like(x_adj)
     elif init_choice == "constant":
         x0 = 0.5 * torch.ones_like(x_adj)
+    elif init_choice == "backprojection":
+        # A^T y / A^T 1: keeps the intensity scale of y (real data in photon counts)
+        x0 = x_adj / physics.A_adjoint(torch.ones_like(observation)).clamp_min(1e-12)
     else:
         raise ValueError(f"Unknown init: {init_choice}")
     return {"est": (x0, x0.clone())}
 
 
 def build_model(prior, data_fidelity, iteration, stepsize, sigma, lam, n_iter,
-                init_choice="adjoint_y", deepinv_backtracking=False, stop_fn=None):
+                init_choice="adjoint_y", deepinv_backtracking=False, stop_fn=None, x_max=1.0):
     """stop_fn: check_conv_fn(it, X_prev, X) -> bool for early stopping (None: always
-    n_iter iterations)."""
+    n_iter iterations). x_max: output clamped to [0, x_max] (None: no upper bound)."""
     model = optim_builder(
         iteration=iteration, prior=prior, data_fidelity=data_fidelity, g_first=False,
         params_algo={"stepsize": stepsize, "g_param": sigma, "lambda": lam},
         backtracking=deepinv_backtracking, early_stop=stop_fn is not None, max_iter=n_iter,
-        get_output=lambda X: X["est"][0].clamp(0, 1),
+        get_output=lambda X: X["est"][0].clamp(min=0, max=x_max),
         custom_init=partial(init_fn, init_choice=init_choice),
         verbose=False,
     )

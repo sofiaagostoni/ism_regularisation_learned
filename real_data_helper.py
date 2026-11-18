@@ -222,7 +222,8 @@ def sweep(cfg, name, fidelity_name, loss="none", algo=None,
                                      grids["lambda"], grids["step"])
 
     run_cfg = replace(cfg, sigma_grid=sigmas, iter_grid=iters,
-                      lam_grid=lambdas, step_grid=steps)
+                      lam_grid=lambdas, step_grid=steps,
+                      fid_bkg=fidelity_name.upper() in gs.BKG_FIDELITIES)  # as experiment_paths
     if save:
         run_cfg.init_run_dir()
     say = (lambda msg: gs.log(msg, run_cfg)) if save else tqdm.write

@@ -1,15 +1,20 @@
 #%%
 """
-Evaluate the convergent explicit-prior methods (WCRR, WCRR_ISM, smoothed TV) on a set of images.
+Evaluate the convergent explicit-prior methods (WCRR, WCRR_ISM, smoothed TV, TV, L1) on a
+set of images, and PnP DRUNet (pretrained, fine-tuned, from scratch) as a reference.
 
 For every (image, flux, seed) the measurement is simulated once and shared by all
 methods; each method then gets its own adaptive parameter search on that image
-(per-image tuning with the ground truth = oracle parameters). Iterations are not tuned:
-every method runs N_ITER iterations, so the reconstruction is the (approximate) minimizer.
+(per-image tuning with the ground truth = oracle parameters). Explicit priors: iterations
+are not tuned, every run goes to N_ITER (or early stop at STOP_TOL), so the reconstruction
+is the (approximate) minimizer. DRUNet (PnP, not convergent): sigma, step AND the number
+of iterations are tuned (best iteration of each run = oracle early stopping).
 
     python evaluate_methods.py                 # everything, sequentially
     python evaluate_methods.py --shard 0/2     # half of the jobs (e.g. one per GPU)
     python evaluate_methods.py --plan          # print the jobs and searches, run nothing
+    python evaluate_methods.py --images tub    # only these images (combine with --methods)
+    python evaluate_methods.py --fluxes 5 10 40   # these fluxes instead of FLUXES
     python evaluate_methods.py --methods TV_smooth  # only these methods (e.g. a new one while
                                                # the others are still running)
 
@@ -45,33 +50,55 @@ FIDELITY = "KL"                 # default; a method can override it with fidelit
 N_ITER = 5000                   # maximum number of iterations
 # Early stopping: ||x_{k+1} - x_k|| / ||x_k|| < STOP_TOL for STOP_PATIENCE consecutive
 # iterations (None: always N_ITER). Changes the run_id: results go to new run folders.
-STOP_TOL = 1e-6
+STOP_TOL = 1e-5
 STOP_PATIENCE = 10
 
 # 2D, 256 x 256 ground truths in Data/Simul_data
 # (Castle_gray is a natural image: add it only as an out-of-distribution test)
-IMAGES = ["circle_phantom", "tub", "tub_level", "tub_balls", "balls", "mixture_256"]
+IMAGES = ["circle_phantom", "tub", "tub_level", "tub_balls", "balls", "mixture_256", "Castle_gray"]
 FLUXES = [20]
 SEEDS = [0]                     # noise realizations; add more to average them out
 
 base = Config(is_3d=False, Nz=1, save_dir=SAVE_DIR, init_choice="adjoint_y",
               backtracking="custom", iter_grid=torch.tensor([N_ITER]), search="adaptive",
-              search_max_expand=3.0, stop_tol=STOP_TOL, stop_patience=STOP_PATIENCE)
+              search_max_expand=3.0, stop_tol=STOP_TOL, stop_patience=STOP_PATIENCE,
+              batched_physics=True)   # 25 detectors as one operator: same results, faster
+
+# >>>>>>>>>> DRUNET ADDED >>>>>>>>>>
+DRUNET_ITERS = torch.arange(5, 505, 5)  # iteration counts compared (snapshots of one run)
+DRUNET_CFG = dict(kl_step_scale=1.0, iter_grid=DRUNET_ITERS, stop_tol=None,
+                  sigma_range=(-3, -1), step_range=(2, 5), search_points=5, search_tol=0.1)
+# <<<<<<<<<< DRUNET ADDED <<<<<<<<<<
+
+# Hard ceiling of the WCRR sigma search (log10): from sigma ~ 10^3.05 the WCRR sigma spline
+# gives NaN, and on the GPU a device-side assert kills the whole process. Not in run_id:
+# finished runs (none went above it) keep their files.
+WCRR_SIGMA_MAX = 2.5
 
 # Adaptive search (see adaptive_search.py), ranges in log10: a coarse scan of the
 # starting range, extended by up to search_max_expand decades on each side when the
 # best value is on its border, then refined to search_tol decades.
 #   1 parameter  (TV, L1): golden section,           ~12-16 runs
-#   2 parameters (WCRR)  : 3 x 3 pattern search,     ~45-60 runs
+#   2 parameters (WCRR: sigma, lambda; DRUNet: sigma, step): 3 x 3 pattern search, ~45-60 runs
 METHODS = {
     "WCRR": dict(cfg=replace(base, prior_name="WCRR", kl_step_scale=1e-2, l2_step_scale=1e-1,
-                             sigma_range=(-1, 2.5), lam_range=(-2, 3),
+                             sigma_range=(-1, 2.5), sigma_max=WCRR_SIGMA_MAX, lam_range=(-2, 3),
                              search_points=5, search_tol=0.1),
                  algo="PROJ_GD"),
     "WCRR_ISM": dict(cfg=replace(base, prior_name="WCRR_ISM", kl_step_scale=1e-2, l2_step_scale=1e-1,
-                             sigma_range=(-1, 2.5), lam_range=(-2, 3),
+                             sigma_range=(-1, 2.5), sigma_max=WCRR_SIGMA_MAX, lam_range=(-2, 3),
                              search_points=5, search_tol=0.1),
                  algo="PROJ_GD"),
+    # learned-hs WCHS (WCRR on Hessian eigenvalues), same sigma convention and ranges as WCRR
+    "WCHS_free": dict(cfg=replace(base, prior_name="WCHS_free", kl_step_scale=1e-2, l2_step_scale=1e-1,
+                                  sigma_range=(-1, 2.5), sigma_max=WCRR_SIGMA_MAX, lam_range=(-2, 3),
+                                  search_points=5, search_tol=0.1),
+                      algo="PROJ_GD"),
+    "WCHS_free_smlm": dict(cfg=replace(base, prior_name="WCHS_free_smlm", kl_step_scale=1e-2,
+                                       l2_step_scale=1e-1, sigma_range=(-1, 2.5),
+                                       sigma_max=WCRR_SIGMA_MAX, lam_range=(-2, 3),
+                                       search_points=5, search_tol=0.1),
+                           algo="PROJ_GD"),
     "TV_smooth": dict(cfg=replace(base, prior_name="TV_smooth", tv_eps=1e-2,
                                   kl_step_scale=1e-2, l2_step_scale=1e-1,
                                   lam_range=(-4, 3), search_points=8, search_tol=0.05),
@@ -81,11 +108,11 @@ METHODS = {
     # The measurements are the same as above (simulated with background): only the
     # model has no background. Starting ranges copied from the PROJ_GD / PROX_GD methods.
     "WCRR_MD": dict(cfg=replace(base, prior_name="WCRR", kl_step_scale=1e-2,
-                                sigma_range=(-1, 2.5), lam_range=(-2, 3),
+                                sigma_range=(-1, 2.5), sigma_max=WCRR_SIGMA_MAX, lam_range=(-2, 3),
                                 search_points=5, search_tol=0.1),
                     algo="MD_BURG", fidelity="KL0"),
     "WCRR_ISM_MD": dict(cfg=replace(base, prior_name="WCRR_ISM", kl_step_scale=1e-2,
-                                    sigma_range=(-1, 2.5), lam_range=(-2, 3),
+                                    sigma_range=(-1, 2.5), sigma_max=WCRR_SIGMA_MAX, lam_range=(-2, 3),
                                     search_points=5, search_tol=0.1),
                         algo="MD_BURG", fidelity="KL0"),
     "TV_smooth_MD": dict(cfg=replace(base, prior_name="TV_smooth", tv_eps=1e-2,
@@ -94,36 +121,105 @@ METHODS = {
                          algo="MD_BURG", fidelity="KL0"),
     # <<<<<<<<<< MD ADDED <<<<<<<<<<
     # >>>>>>>>>> L2 ADDED >>>>>>>>>>
-    # Same priors with the L2 fidelity 0.5 ||Ax - y||^2 (y in intensity units, gain 1/flux).
+    # Same priors with the L2 fidelity 0.5 ||Ax + b - y||^2 (y, b in intensity units).
     # Its curvature at x_gt is ~1e3-1e5 smaller than the KL one at flux 20, so the optimal
     # lambda is ~3-4 decades lower: lam_range shifted by -3.5 decades w.r.t. the KL methods
     # (the adaptive search can still expand by search_max_expand). sigma is in image units,
     # independent of the fidelity: same range.
-    "WCRR_L2": dict(cfg=replace(base, prior_name="WCRR", l2_step_scale=1e-1,
-                                sigma_range=(-1, 2.5), lam_range=(-5.5, -0.5),
+    # bt_s = 1e-3 (largest step 1000 instead of 1): the L2 curvature is small (L_l2 ~ 0.08,
+    # + lam Lip(grad R)), the natural step is > 1 and the default cap bt_s = 1 slowed the
+    # runs down (as for TV_L2 / L1_L2 below).
+    "WCRR_L2": dict(cfg=replace(base, prior_name="WCRR", l2_step_scale=1e-1, bt_s=1e-3,
+                                sigma_range=(-1, 2.5), sigma_max=WCRR_SIGMA_MAX, lam_range=(-5.5, -0.5),
                                 search_points=5, search_tol=0.1),
                     algo="PROJ_GD", fidelity="L2"),
-    "WCRR_ISM_L2": dict(cfg=replace(base, prior_name="WCRR_ISM", l2_step_scale=1e-1,
-                                    sigma_range=(-1, 2.5), lam_range=(-5.5, -0.5),
+    "WCRR_ISM_L2": dict(cfg=replace(base, prior_name="WCRR_ISM", l2_step_scale=1e-1, bt_s=1e-3,
+                                    sigma_range=(-1, 2.5), sigma_max=WCRR_SIGMA_MAX, lam_range=(-5.5, -0.5),
                                     search_points=5, search_tol=0.1),
                         algo="PROJ_GD", fidelity="L2"),
+    "WCHS_free_L2": dict(cfg=replace(base, prior_name="WCHS_free", l2_step_scale=1e-1, bt_s=1e-3,
+                                     sigma_range=(-1, 2.5), sigma_max=WCRR_SIGMA_MAX,
+                                     lam_range=(-5.5, -0.5), search_points=5, search_tol=0.1),
+                         algo="PROJ_GD", fidelity="L2"),
+    "WCHS_free_smlm_L2": dict(cfg=replace(base, prior_name="WCHS_free_smlm", l2_step_scale=1e-1,
+                                          bt_s=1e-3, sigma_range=(-1, 2.5), sigma_max=WCRR_SIGMA_MAX,
+                                          lam_range=(-5.5, -0.5), search_points=5, search_tol=0.1),
+                              algo="PROJ_GD", fidelity="L2"),
     "TV_smooth_L2": dict(cfg=replace(base, prior_name="TV_smooth", tv_eps=1e-2, l2_step_scale=1e-1,
+                                     bt_s=1e-3,
                                      lam_range=(-7.5, -0.5), search_points=8, search_tol=0.05),
                          algo="PROJ_GD", fidelity="L2"),
     # <<<<<<<<<< L2 ADDED <<<<<<<<<<
+    # >>>>>>>>>> PROX ADDED >>>>>>>>>>
+    # Non-smooth priors, proximal gradient with backtracking, x >= 0:
+    #   x+ = max(0, prox_{tau lam R}(x - tau grad f))
+    # TV_nonsmooth: isotropic TV (eps = 0), prox of TV + {x >= 0} by FGP (warm-started).
+    # L1: ||x||_1, soft thresholding. Same ranges as TV_smooth (both ~ 1 per pixel).
+    "TV": dict(cfg=replace(base, prior_name="TV_nonsmooth", tv_prox_iter=200, tv_prox_tol=1e-6,
+                           kl_step_scale=1e-2, l2_step_scale=1e-1,
+                           lam_range=(-4, 3), search_points=8, search_tol=0.05),
+               algo="PROX_GD"),
+    "L1": dict(cfg=replace(base, prior_name="L1", kl_step_scale=1e-2, l2_step_scale=1e-1,
+                           lam_range=(-4, 3), search_points=8, search_tol=0.05),
+               algo="PROX_GD"),
+    # Same with the L2 fidelity. lambda ~3.5 decades lower than KL (as TV_smooth_L2).
+    # bt_s = 1e-3 (largest step 1000 instead of 1): with L2 the gradient step only sees
+    # f (curvature <= ~0.08), so 1/L ~ 12 > 1 and the default cap slowed the runs down
+    # Prox step = PROJ_GD with a prox.
+    "TV_L2": dict(cfg=replace(base, prior_name="TV_nonsmooth", tv_prox_iter=200, tv_prox_tol=1e-6,
+                              l2_step_scale=1e-1, bt_s=1e-3,
+                              lam_range=(-7.5, -0.5), search_points=8, search_tol=0.05),
+                  algo="PROX_GD", fidelity="L2"),
+    "L1_L2": dict(cfg=replace(base, prior_name="L1", l2_step_scale=1e-1, bt_s=1e-3,
+                              lam_range=(-7.5, -0.5), search_points=8, search_tol=0.05),
+                  algo="PROX_GD", fidelity="L2"),
+    # learned-hs isotropic TV (IsotropicTVPrior: the same K as TV_nonsmooth), prox by FGP
+    # (+ x >= 0), same settings and ranges as TV / TV_L2.
+    "TV_lhs": dict(cfg=replace(base, prior_name="TV_lhs", tv_prox_iter=200, tv_prox_tol=1e-6,
+                               kl_step_scale=1e-2, l2_step_scale=1e-1,
+                               lam_range=(-4, 3), search_points=8, search_tol=0.05),
+                   algo="PROX_GD"),
+    "TV_lhs_L2": dict(cfg=replace(base, prior_name="TV_lhs", tv_prox_iter=200, tv_prox_tol=1e-6,
+                                  l2_step_scale=1e-1, bt_s=1e-3,
+                                  lam_range=(-7.5, -0.5), search_points=8, search_tol=0.05),
+                      algo="PROX_GD", fidelity="L2"),
+    # Hessian-Schatten (nuclear norm of the 3x3 Hessian, learned-hs HessianSchattenPrior),
+    # prox by FGP (+ x >= 0), same settings and ranges as TV / TV_L2.
+    "HS": dict(cfg=replace(base, prior_name="HS", tv_prox_iter=200, tv_prox_tol=1e-6,
+                           kl_step_scale=1e-2, l2_step_scale=1e-1,
+                           lam_range=(-4, 3), search_points=8, search_tol=0.05),
+               algo="PROX_GD"),
+    "HS_L2": dict(cfg=replace(base, prior_name="HS", tv_prox_iter=200, tv_prox_tol=1e-6,
+                              l2_step_scale=1e-1, bt_s=1e-3,
+                              lam_range=(-7.5, -0.5), search_points=8, search_tol=0.05),
+                  algo="PROX_GD", fidelity="L2"),
+    # <<<<<<<<<< PROX ADDED <<<<<<<<<<
+    # >>>>>>>>>> DRUNET ADDED >>>>>>>>>>
+    # PnP-PGD x <- D_sigma(x - tau grad f(x)), KL fidelity, checkpoints trained with the L2
+    # loss (LOSS; the pretrained DRUNet has one checkpoint only). Not convergent: the
+    # number of iterations is chosen too (oracle early stopping, best PSNR over
+    # DRUNET_ITERS within one run). 2D adaptive search over (sigma, step multiplier);
+    # tau = step / L_kl (kl_step_scale = 1). Starting ranges from Results/results_gridsearch
+    # (best sigma ~ 10^-2.2 .. 10^-1.6, step ~ 10^3 .. 10^4.5).
+    **{name: dict(cfg=replace(base, prior_name=prior, **DRUNET_CFG), algo="PGD")
+       for name, prior in [("DRUNet", "Drunet"), ("DRUNet_ft", "Drunet_finetune"),
+                           ("DRUNet_scratch", "Drunet_fromscratch")]},
+    # <<<<<<<<<< DRUNET ADDED <<<<<<<<<<
 }
 LOSS = "L2"                     # unused by these priors, only part of the call signature
 
 CSV_FIELDS = ["image", "flux", "seed", "method", "fidelity", "algo", "lambda", "sigma",
-              "iter", "iter_run", "lambda_on_edge", "sigma_on_edge", "n_runs", "final_residual",
+              "step_scale", "iter", "iter_run", "lambda_on_edge", "sigma_on_edge",
+              "step_on_edge", "iter_on_edge", "n_runs", "final_residual",
               "psnr", "ssim", "microssim", "run_id", "path"]
 
 
 # ---------------------------------------------------------------------------
 
-def jobs():
-    """(image, flux, seed) groups: the measurement is shared by all methods of a group."""
-    return list(itertools.product(IMAGES, FLUXES, SEEDS))
+def jobs(fluxes=None):
+    """(image, flux, seed) groups: the measurement is shared by all methods of a group.
+    fluxes: None = FLUXES."""
+    return list(itertools.product(IMAGES, fluxes or FLUXES, SEEDS))
 
 
 def on_edge(value, grid):
@@ -138,7 +234,7 @@ def csv_row(res, image, flux, seed, method, path):
     m = res.get("metrics") or {}
     if m.get("residual") and len(m["residual"][0]):
         residual = float(m["residual"][0][-1])
-    lam, sigma = res["lambda"], res["sigma"]
+    lam, sigma, step = res["lambda"], res["sigma"], res.get("step_scale")
     hit = res.get("hit_bound") or {}           # adaptive search: at the expansion limit
     return {
         "image": image, "flux": flux, "seed": seed, "method": method,
@@ -146,6 +242,9 @@ def csv_row(res, image, flux, seed, method, path):
         "iter": res["iter"], "iter_run": res.get("iter_run", res["iter"]),
         "lambda_on_edge": hit.get("lambda", lam is not None and on_edge(lam, res["lambda_grid"])),
         "sigma_on_edge": hit.get("sigma", sigma is not None and on_edge(sigma, res["sigma_grid"])),
+        "step_scale": step,
+        "step_on_edge": hit.get("step", step is not None and on_edge(step, res["step_grid"])),
+        "iter_on_edge": hit.get("iter", False),     # best iteration = the last one compared
         "n_runs": (len(res["evaluations"]) if res.get("evaluations") is not None
                    else int(torch.isfinite(res["psnr_map"]).sum())),
         "final_residual": residual,
@@ -178,16 +277,22 @@ def print_plan(my_jobs, methods):
     stop = (f", stop at relative step < {STOP_TOL:g} ({STOP_PATIENCE} times in a row)"
             if STOP_TOL is not None else "")
     print(f"\n{len(my_jobs)} (image, flux, seed) groups x {len(methods)} methods, "
-          f"at most {N_ITER} iterations per run{stop}")
+          f"explicit priors: at most {N_ITER} iterations per run{stop}")
 
 
-def main(shard, n_shards, plan_only, only=None):
+def main(shard, n_shards, plan_only, only=None, images=None, fluxes=None):
     """only: list of method names to run (own csv file); None = all of METHODS."""
     methods = METHODS if only is None else {k: METHODS[k] for k in only}
     suffix = "" if n_shards == 1 else f"_shard{shard}of{n_shards}"
     if only is not None:
         suffix += "_" + "_".join(only)
-    my_jobs = jobs()[shard::n_shards]
+    all_jobs = jobs(fluxes)
+    if fluxes is not None:               # other fluxes than FLUXES (own csv file)
+        suffix += "_flux" + "-".join(f"{f:g}" for f in fluxes)
+    if images is not None:               # only these images (own csv file)
+        all_jobs = [j for j in all_jobs if j[0] in images]
+        suffix += "_" + "_".join(images)
+    my_jobs = all_jobs[shard::n_shards]
     print_plan(my_jobs, methods)
     if plan_only:
         return
@@ -227,8 +332,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard", default="0/1", help="i/n: run every n-th job starting at i")
     parser.add_argument("--plan", action="store_true", help="print the jobs and grids only")
+    parser.add_argument("--fluxes", nargs="+", type=float,
+                        help="these fluxes instead of FLUXES (results in their own csv)")
+    parser.add_argument("--images", nargs="+", choices=IMAGES,
+                        help="run only these images (results in their own csv)")
     parser.add_argument("--methods", nargs="+", choices=list(METHODS),
                         help="run only these methods (results in their own csv)")
     args = parser.parse_args()
     shard, n_shards = map(int, args.shard.split("/"))
-    main(shard, n_shards, args.plan, args.methods)
+    fluxes = None if args.fluxes is None else [int(f) if f == int(f) else f for f in args.fluxes]
+    main(shard, n_shards, args.plan, args.methods, args.images, fluxes)
+
+
+
+
+

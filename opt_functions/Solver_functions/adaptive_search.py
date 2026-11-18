@@ -27,12 +27,15 @@ NDIGITS = 6                               # rounding of log10 values in the cach
 
 
 def coarse_to_fine(score, ranges, n_points=5, tol=0.05, max_expand=3.0, min_gain=1e-3,
-                   cache=None, on_eval=None):
+                   cache=None, on_eval=None, bounds=None):
     """
     score      : function {axis: log10 value} -> float to maximize (-inf = failed)
     ranges     : {axis: (log10 lo, log10 hi)}, 1 or 2 axes
     cache      : dict {tuple of log10 values: score}, filled in place (resume)
     on_eval    : called as on_eval(point, value) after every new evaluation
+    bounds     : {axis: (log10 min, log10 max)}, hard limits (None = no limit): points
+                 outside are never evaluated (score -inf), the expansion stops there and
+                 reports hit_bound. E.g. sigma of WCRR, whose cost is NaN for large sigma.
     Returns {"best": {axis: log10 value}, "score", "hit_bound": {axis: bool},
              "explored": {axis: (min, max)}, "n_evals": new evaluations}.
     """
@@ -41,9 +44,18 @@ def coarse_to_fine(score, ranges, n_points=5, tol=0.05, max_expand=3.0, min_gain
         raise ValueError(f"1 or 2 axes supported, got {axes}")
     cache = {} if cache is None else cache
     n_new = 0
+    hard = {a: (-math.inf, math.inf) for a in axes}
+    for a, (b_lo, b_hi) in (bounds or {}).items():
+        if a in hard:
+            hard[a] = (-math.inf if b_lo is None else b_lo, math.inf if b_hi is None else b_hi)
+
+    def inside(point):
+        return all(hard[a][0] - 1e-9 <= point[a] <= hard[a][1] + 1e-9 for a in axes)
 
     def f(point):
         nonlocal n_new
+        if not inside(point):
+            return -math.inf
         key = tuple(round(float(point[a]), NDIGITS) for a in axes)
         if key not in cache:
             value = float(score(dict(zip(axes, key))))
@@ -71,7 +83,8 @@ def coarse_to_fine(score, ranges, n_points=5, tol=0.05, max_expand=3.0, min_gain
     best = best_of(grid_points())
 
     # 2. expansion
-    limits = {a: (lo - max_expand, hi + max_expand) for a, (lo, hi) in ranges.items()}
+    limits = {a: (max(lo - max_expand, hard[a][0]), min(hi + max_expand, hard[a][1]))
+              for a, (lo, hi) in ranges.items()}
     hit_bound = {a: False for a in axes}
     moved = True
     while moved:

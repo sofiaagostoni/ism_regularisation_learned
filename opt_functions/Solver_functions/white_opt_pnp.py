@@ -682,6 +682,3 @@ def compute_whiteness(x_curr, noise_image,  physics, back_vec, is_3d, mask_type 
 #     # Altrimenti, il punto a distanza massima è il miglior compromesso "gomito/valle".
     
 #     return mu_np[best_idx]
-
-
-
